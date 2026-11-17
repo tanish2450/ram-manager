@@ -1,0 +1,77 @@
+{
+  "model": "typesafe/jev-1.14",
+  "endpoint": "https://openrouter.ai/api/alpha/decisions",
+
+  "autoApply": false,
+  "autoCloseAt": 0.85,
+  "askAt": 0.60,
+  "onlyWhenRamAbove": 70,
+  "decideEveryMinutes": 10,
+  "sampleEverySeconds": 30,
+
+  "neverTouch": ["chrome", "msedge", "firefox", "explorer", "Code", "claude", "powershell", "pwsh", "WindowsTerminal", "Taskmgr", "MsMpEng", "dwm"],
+
+  "apps": [
+    {
+      "id": "phone_link",
+      "label": "Microsoft Phone Link",
+      "kind": "process",
+      "process": "PhoneExperienceHost",
+      "start": "shell:AppsFolder\\Microsoft.YourPhone_8wekyb3d8bbwe!App",
+      "priority": "rarely",
+      "forceOk": true
+    },
+    {
+      "id": "onedrive",
+      "label": "OneDrive file sync",
+      "kind": "process",
+      "process": "OneDrive",
+      "stopCommand": ["%ProgramFiles%\\Microsoft OneDrive\\OneDrive.exe", "/shutdown"],
+      "start": "%ProgramFiles%\\Microsoft OneDrive\\OneDrive.exe",
+      "priority": "sometimes",
+      "forceOk": false
+    },
+    {
+      "id": "adobe_sync",
+      "label": "Adobe Acrobat collaboration sync",
+      "kind": "process",
+      "process": "AdobeCollabSync",
+      "start": null,
+      "priority": "rarely",
+      "forceOk": true
+    },
+    {
+      "id": "nearby_share",
+      "label": "Google Nearby Share",
+      "kind": "process",
+      "process": "nearby_share",
+      "start": "%ProgramFiles%\\Google\\NearbyShare\\nearby_share.exe",
+      "priority": "rarely",
+      "forceOk": true
+    },
+    {
+      "id": "lenovo_voice",
+      "label": "Lenovo Voice (dictation/voice assistant)",
+      "kind": "process",
+      "process": "GlobalPresenter",
+      "start": "shell:AppsFolder\\E046963F.LenovoVoiceWorldWide_k1h2ywk1493x8!App",
+      "priority": "rarely",
+      "forceOk": true
+    },
+    {
+      "id": "mysql",
+      "label": "MySQL database server",
+      "kind": "service",
+      "service": "MySQL80",
+      "process": "mysqld",
+      "activityByCpu": 1.0,
+      "priority": "sometimes"
+    }
+  ],
+
+  "modes": {
+    "light":  { "stop": ["phone_link", "onedrive", "adobe_sync", "nearby_share", "lenovo_voice", "mysql"], "start": [] },
+    "work":   { "stop": ["phone_link", "nearby_share", "adobe_sync", "lenovo_voice"], "start": ["mysql"] },
+    "normal": { "stop": [], "start": ["phone_link", "onedrive", "nearby_share", "lenovo_voice"] }
+  }
+}
