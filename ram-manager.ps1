@@ -119,6 +119,142 @@ function Get-ProcessCpuSeconds([string]$procName) {
     return (($rows | Measure-Object PercentProcessorTime -Sum).Sum) / 1e7
 }
 
+# ================================================================ discovery (find background apps automatically)
+
+# Never offered: runtimes, terminals and dev tools that other things depend on.
+$BuiltInSkip = @('msedgewebview2', 'OpenConsole', 'conhost', 'cua', 'node', 'python', 'pythonw', 'bash', 'git', 'ssh', 'ssh-agent', 'wsl', 'wslhost', 'wslservice', 'vmmem', 'java', 'javaw')
+# A process started from one of these was launched by you from a command line - leave it alone.
+$ShellParents = @('cmd', 'powershell', 'pwsh', 'bash', 'WindowsTerminal', 'OpenConsole', 'conhost', 'wsl', 'wslhost', 'Code')
+# Hardware and security helpers: offered, but switched off until you choose to manage them.
+$RiskyPattern = '(?i)audio|sound|realtek|elevoc|dolby|waves|nahimic|intel|nvidia|amd|radeon|synaptics|elan|touchpad|driver|bluetooth|wi-?fi|wireless|hotkey|function ?key|keyboard|thermal|smart ?appearance|sensing|graphics|igfx|security|antivirus|defender|firewall|vpn|password|backup'
+
+function Get-StartupNames {
+    $names = @{}
+    $add = { param($cmd) if ($cmd -match '^\s*"([^"]+\.exe)"' -or $cmd -match '^\s*(\S+\.exe)') { $names[[IO.Path]::GetFileNameWithoutExtension($matches[1]).ToLower()] = $true } }
+    foreach ($k in 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run') {
+        $item = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+        if ($item) { foreach ($p in $item.PSObject.Properties) { if ($p.Name -notlike 'PS*') { & $add ([string]$p.Value) } } }
+    }
+    $ws = New-Object -ComObject WScript.Shell
+    foreach ($dir in [Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup')) {
+        Get-ChildItem $dir -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object { & $add ('"' + $ws.CreateShortcut($_.FullName).TargetPath + '"') }
+    }
+    return $names
+}
+
+$script:StartAppsCache = $null
+function Get-StoreAppLaunch([string]$path) {
+    if ($path -notmatch '\\WindowsApps\\([^\\]+)\\') { return $null }
+    $parts = $matches[1] -split '_'
+    $family = "$($parts[0])_$($parts[-1])"
+    if ($null -eq $script:StartAppsCache) { $script:StartAppsCache = @(Get-StartApps) }
+    $sa = $script:StartAppsCache | Where-Object { $_.AppID -like "$family!*" } | Select-Object -First 1
+    if ($sa) { return "shell:AppsFolder\$($sa.AppID)" }
+    return $null
+}
+
+# Returns background apps and services that are worth managing and not yet in config.
+function Find-BackgroundApps {
+    $minMB = if ($Config.discoverMinMB) { [int]$Config.discoverMinMB } else { 15 }
+    $known = @{}
+    foreach ($a in $Config.apps) { if ($a.process) { $known[$a.process.ToLower()] = $true } }
+    foreach ($n in @($Config.neverTouch) + $BuiltInSkip + @($Config.ignored)) { if ($n) { $known[([string]$n).ToLower()] = $true } }
+
+    $all = @(Get-CimInstance Win32_Process)
+    $byPid = @{}; foreach ($p in $all) { $byPid[[int]$p.ProcessId] = $p }
+    $svcByPid = @{}; Get-CimInstance Win32_Service -Filter "State='Running'" | ForEach-Object { $svcByPid[[int]$_.ProcessId] = $_ }
+    $ws = @{}; $hasWin = @{}
+    Get-Process | ForEach-Object { $ws[$_.Id] = $_.WorkingSet64; if ($_.MainWindowHandle -ne 0) { $hasWin[$_.Name] = $true } }
+    $startup = Get-StartupNames
+    $sysRoot = $env:SystemRoot
+
+    # Install folders of apps already managed or protected: anything inside them is part of that app.
+    $ownedDirs = @()
+    foreach ($p in $all) {
+        $pn = [IO.Path]::GetFileNameWithoutExtension($p.Name).ToLower()
+        if ($p.ExecutablePath -and $known[$pn] -and $p.ExecutablePath -notlike "$sysRoot\*") { $ownedDirs += (Split-Path $p.ExecutablePath -Parent) + '\' }
+    }
+    foreach ($a in $Config.apps) { if ($a.start -and $a.start -notlike 'shell:*') { $ownedDirs += (Split-Path ([Environment]::ExpandEnvironmentVariables($a.start)) -Parent) + '\' } }
+    $ownedDirs = @($ownedDirs | Select-Object -Unique)
+
+    $groups = $all | Group-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) }
+    foreach ($g in $groups) {
+        $name = $g.Name
+        if ($known[$name.ToLower()]) { continue }
+        $path = ($g.Group | Where-Object { $_.ExecutablePath } | Select-Object -First 1).ExecutablePath
+        if (-not $path -or $path -like "$sysRoot\*") { continue }          # Windows itself / unreadable
+        if (@($ownedDirs | Where-Object { $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { continue }
+        $mb = [math]::Round((($g.Group | ForEach-Object { $ws[[int]$_.ProcessId] } | Measure-Object -Sum).Sum) / 1MB)
+        if ($mb -lt $minMB) { continue }
+
+        $svc = $g.Group | ForEach-Object { $svcByPid[[int]$_.ProcessId] } | Where-Object { $_ } | Select-Object -First 1
+        if (-not $svc -and ($g.Group | Select-Object -First 1).SessionId -eq 0) { continue }   # system-level, not ours to touch
+
+        # Skip helpers whose every copy was started by another app (closing the app closes them),
+        # or by a command line you opened.
+        $parentNames = @($g.Group | ForEach-Object {
+            $pp = $byPid[[int]$_.ParentProcessId]
+            if ($pp) { [IO.Path]::GetFileNameWithoutExtension($pp.Name) } else { '' }
+        })
+        if (@($parentNames | Where-Object { $ShellParents -contains $_ }).Count -gt 0) { continue }
+        $ownerApps = @($parentNames | Where-Object { $_ -and $_ -ne $name -and $_ -notin @('explorer', 'svchost', 'services', 'sihost', 'userinit', 'winlogon') })
+        $selfOrApp = @($parentNames | Where-Object { $_ -eq $name -or $ownerApps -contains $_ })
+        if (-not $svc -and $ownerApps.Count -gt 0 -and $selfOrApp.Count -eq $parentNames.Count) { continue }
+
+        $vi = $null; try { $vi = (Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo } catch {}
+        $company = if ($vi) { [string]$vi.CompanyName } else { '' }
+        $desc    = if ($vi -and $vi.FileDescription) { ([string]$vi.FileDescription).Trim() } else { '' }
+        if ($desc -match '(?i)subprocess|crash ?handler|crashpad') { continue }
+
+        $label = if ($svc) { $svc.DisplayName } elseif ($desc -and $desc -notlike '*.exe') { $desc } else { $name }
+        $risky = ("$label $company $name $path") -match $RiskyPattern
+        $byWindows = (-not $svc) -and ($parentNames -contains 'svchost')
+        $note = if ($risky) { 'hardware/security helper - check before managing' }
+                elseif ($byWindows) { 'started by Windows - it may restart itself' }
+                elseif ($svc) { 'Windows service - needs Administrator to stop/start' }
+                else { '' }
+
+        [pscustomobject]@{
+            mb = $mb; company = $company
+            app = [pscustomobject][ordered]@{
+                id            = ''
+                label         = $label
+                kind          = $(if ($svc) { 'service' } else { 'process' })
+                service       = $(if ($svc) { $svc.Name } else { $null })
+                process       = $name
+                start         = $(if ($svc) { $null } elseif ($path -like '*\WindowsApps\*') { Get-StoreAppLaunch $path } else { $path })
+                priority      = 'sometimes'
+                forceOk       = $false
+                enabled       = -not ($risky -or $byWindows)
+                discovered    = $true
+                startsAtLogin = [bool]$startup[$name.ToLower()]
+                note          = $note
+            }
+        }
+    }
+}
+
+function Add-DiscoveredApps($found) {
+    $added = @()
+    foreach ($f in @($found)) {
+        $a = $f.app
+        $base = ($a.process.ToLower() -replace '[^a-z0-9]+', '_').Trim('_')
+        if ($a.kind -eq 'service') { $base = "svc_$base" }
+        $id = $base; $n = 2
+        while ($Config.apps | Where-Object { $_.id -eq $id }) { $id = "${base}_$n"; $n++ }
+        $a.id = $id
+        $Config.apps = @($Config.apps) + $a
+        $added += $a
+    }
+    if ($added) { Save-Config }
+    return $added
+}
+
+function Add-IgnoredProcess([string]$proc) {
+    $list = @($Config.ignored | Where-Object { $_ }) + $proc | Select-Object -Unique
+    $Config | Add-Member -NotePropertyName ignored -NotePropertyValue @($list) -Force
+}
+
 # ================================================================ learned data (data\usage.json)
 
 function ConvertTo-Hash($o) {
@@ -250,21 +386,138 @@ function Get-AutoCloseAt($d, $app) {
     return [math]::Min(0.99, [math]::Max($base - 0.10, $t))
 }
 
+# ================================================================ safety (check before, verify after, undo if broken)
+
+# Windows services that must never be stopped, even indirectly.
+$CoreServices = @('Audiosrv', 'AudioEndpointBuilder', 'Dhcp', 'Dnscache', 'NlaSvc', 'nsi', 'WlanSvc', 'Wcmsvc', 'netprofm',
+    'BFE', 'mpssvc', 'WinDefend', 'EventLog', 'RpcSs', 'RpcEptMapper', 'DcomLaunch', 'Power', 'ProfSvc', 'Themes', 'UserManager',
+    'Winmgmt', 'bthserv', 'BthAvctpSvc', 'LanmanWorkstation', 'CryptSvc', 'Schedule', 'SENS', 'ShellHWDetection', 'TokenBroker',
+    'StateRepository', 'SamSs', 'LSM', 'BrokerInfrastructure', 'SystemEventsBroker', 'CoreMessagingRegistrar', 'Spooler')
+
+function Test-Internet {
+    try {
+        $c = New-Object Net.Sockets.TcpClient
+        $ar = $c.BeginConnect('1.1.1.1', 443, $null, $null)
+        $ok = $ar.AsyncWaitHandle.WaitOne(2000) -and $c.Connected
+        $c.Close(); return [bool]$ok
+    } catch { return $false }
+}
+
+# Every process started (directly or indirectly) by the given process ids.
+function Get-DescendantProcesses([int[]]$rootPids) {
+    $all = @(Get-CimInstance Win32_Process)
+    $result = @(); $frontier = @($rootPids)
+    while ($frontier.Count -gt 0) {
+        $kids = @($all | Where-Object { $frontier -contains [int]$_.ParentProcessId -and $rootPids -notcontains [int]$_.ProcessId })
+        $kids = @($kids | Where-Object { $result.ProcessId -notcontains $_.ProcessId })
+        $result += $kids
+        $frontier = @($kids | ForEach-Object { [int]$_.ProcessId })
+    }
+    return $result
+}
+
+# Reasons closing this app could hurt something else. Empty = looks safe.
+function Get-SafetyIssues($app) {
+    $issues = @()
+    if ($app.kind -eq 'service') {
+        if ($CoreServices -contains $app.service) { $issues += 'it is a core Windows service' }
+        $s = Get-Service -Name $app.service -ErrorAction SilentlyContinue
+        if ($s) {
+            if ($s.Status -eq 'Running' -and -not $s.CanStop) { $issues += 'Windows marks this service as not stoppable' }
+            $deps = @($s.DependentServices | Where-Object { $_.Status -eq 'Running' })
+            if ($deps) { $issues += 'other running services depend on it: ' + (($deps | ForEach-Object { $_.DisplayName }) -join ', ') }
+        }
+    }
+    $procs = @(Get-Process -Name $app.process -ErrorAction SilentlyContinue)
+    if ($procs) {
+        $dir = $null; $company = $null
+        $p0 = $procs | Where-Object { $_.Path } | Select-Object -First 1
+        if ($p0) { $dir = (Split-Path $p0.Path -Parent) + '\'; $company = $p0.Company }
+        # Children that are just private parts of this app (same folder, same publisher, its own
+        # embedded browser engine) close with it harmlessly. Anything else is worth a warning.
+        $outside = @(Get-DescendantProcesses @($procs | ForEach-Object { $_.Id }) | Where-Object {
+            $child = $_
+            $childCompany = $null
+            if ($child.ExecutablePath) { try { $childCompany = (Get-Item -LiteralPath $child.ExecutablePath -ErrorAction Stop).VersionInfo.CompanyName } catch {} }
+            $child.Name -notin @('conhost.exe', 'crashpad_handler.exe', 'WerFault.exe', 'msedgewebview2.exe') -and
+            -not ($dir -and $child.ExecutablePath -and $child.ExecutablePath.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) -and
+            -not ($company -and $childCompany -and $childCompany -eq $company) -and
+            [IO.Path]::GetFileNameWithoutExtension($child.Name) -ne $app.process
+        })
+        if ($outside) { $issues += 'it started other programs that would close with it: ' + ((($outside | ForEach-Object { $_.Name }) | Select-Object -Unique) -join ', ') }
+    }
+    return $issues
+}
+
+# What "working" looks like right now: automatic services, open apps, internet.
+function Get-HealthSnapshot {
+    $svc = @{}
+    Get-CimInstance Win32_Service -Filter "State='Running'" | Where-Object { $_.StartMode -eq 'Auto' -or $CoreServices -contains $_.Name } |
+        ForEach-Object { $svc[$_.Name] = $_.DisplayName }
+    $apps = @{}
+    Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -or $Config.neverTouch -contains $_.Name } | ForEach-Object { $apps[$_.Name] = $true }
+    [pscustomobject]@{ services = $svc; apps = $apps; internet = (Test-Internet) }
+}
+
+# What stopped working between two snapshots (ignoring the app we closed on purpose).
+function Compare-Health($before, $after, [string[]]$expectedProcs, [string[]]$expectedServices) {
+    $broken = @()
+    foreach ($name in $before.services.Keys) {
+        if (-not $after.services.ContainsKey($name) -and $expectedServices -notcontains $name) {
+            $broken += [pscustomobject]@{ kind = 'service'; name = $name; text = "service '$($before.services[$name])' stopped" }
+        }
+    }
+    foreach ($name in $before.apps.Keys) {
+        if (-not $after.apps.ContainsKey($name) -and $expectedProcs -notcontains $name) {
+            $broken += [pscustomobject]@{ kind = 'app'; name = $name; text = "app '$name' closed" }
+        }
+    }
+    if ($before.internet -and -not $after.internet) {
+        Start-Sleep -Seconds 3
+        if (-not (Test-Internet)) { $broken += [pscustomobject]@{ kind = 'net'; name = 'internet'; text = 'internet connection was lost' } }
+    }
+    return $broken
+}
+
 # ================================================================ actions
 
-function Stop-App($app, [switch]$Quiet) {
+$script:LastStopMessage = ''
+
+function Stop-App($app, [switch]$Quiet, [switch]$IgnoreWarnings) {
+    $script:LastStopMessage = ''
     if ($app.process -and ($Config.neverTouch -contains $app.process)) {
+        $script:LastStopMessage = "$($app.label): protected"
         Write-Host "  skip $($app.id): protected" -ForegroundColor Yellow; return $false
     }
     if (-not (Test-AppRunning $app)) { if (-not $Quiet) { Write-Host "  $($app.id): not running" }; return $false }
+    if ($app.kind -eq 'service' -and -not (Test-IsAdmin)) {
+        $script:LastStopMessage = "$($app.label): stopping a service needs Administrator"
+        Write-Host "  $($app.id): stopping a service needs an Administrator PowerShell - skipped" -ForegroundColor Yellow
+        return $false
+    }
+
+    # 1) Check BEFORE closing.
+    $issues = @(Get-SafetyIssues $app)
+    if ($issues -and -not $IgnoreWarnings) {
+        $script:LastStopMessage = "$($app.label) not closed: $($issues -join '; ')"
+        Write-Host "  skip $($app.id): $($issues -join '; ')" -ForegroundColor Yellow
+        Write-Log "SAFETY skipped $($app.id): $($issues -join '; ')"
+        return $false
+    }
+
+    # Things we EXPECT to stop: the app itself, what it started, and (if you overrode the warning) its dependent services.
+    $pids = @(Get-Process -Name $app.process -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    $expectedProcs = @($app.process) + @(Get-DescendantProcesses $pids | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) })
+    $expectedServices = @()
+    if ($app.kind -eq 'service') {
+        $expectedServices = @($app.service)
+        if ($IgnoreWarnings) { $expectedServices += @((Get-Service -Name $app.service).DependentServices | ForEach-Object { $_.Name }) }
+    }
+    $health = Get-HealthSnapshot
 
     $before = Get-AppMemoryMB $app
     if ($app.kind -eq 'service') {
-        if (-not (Test-IsAdmin)) {
-            Write-Host "  $($app.id): stopping a service needs an Administrator PowerShell - skipped" -ForegroundColor Yellow
-            return $false
-        }
-        Stop-Service -Name $app.service -Force
+        if ($IgnoreWarnings) { Stop-Service -Name $app.service -Force } else { Stop-Service -Name $app.service }
     }
     else {
         if ($app.stopCommand) {
@@ -282,9 +535,31 @@ function Stop-App($app, [switch]$Quiet) {
     }
 
     if (Test-AppRunning $app) {
+        $script:LastStopMessage = "$($app.label) ignored a normal close (tick Force close if that's OK)"
         Write-Host "  $($app.id): did not close (it may be minimised to the tray). Close it yourself if you want." -ForegroundColor Yellow
         return $false
     }
+
+    # 2) Verify AFTER closing: did anything else stop working? If so, undo and never auto-close it again.
+    Start-Sleep -Seconds 4
+    $broken = @(Compare-Health $health (Get-HealthSnapshot) $expectedProcs $expectedServices)
+    if ($broken) {
+        $what = ($broken | ForEach-Object { $_.text }) -join '; '
+        Write-Host "  closing $($app.label) broke something: $what - undoing" -ForegroundColor Red
+        Start-App $app
+        foreach ($b in $broken | Where-Object { $_.kind -eq 'service' }) {
+            if (Test-IsAdmin) { try { Start-Service -Name $b.name } catch {} }
+        }
+        $app | Add-Member -NotePropertyName enabled -NotePropertyValue $false -Force
+        $app | Add-Member -NotePropertyName note -NotePropertyValue "Auto-disabled: closing it also caused: $what" -Force
+        Save-Config
+        $d = Load-Data; $d.apps[$app.id].reopened++; Save-Data $d
+        Write-Log "SAFETY rolled back $($app.id): $what. App disabled."
+        $script:LastStopMessage = "Closing $($app.label) caused: $what. It was reopened and won't be closed again."
+        return $false
+    }
+
+    $script:LastStopMessage = "Closed $($app.label) (~$before MB freed)"
     Write-Host "  closed $($app.label)  (~$before MB freed)" -ForegroundColor Green
     Write-Log "CLOSED $($app.id) ~$before MB"
     $d = Load-Data
@@ -337,12 +612,17 @@ function Build-JevState($d, $candidates) {
     $totalSamples = 0; foreach ($v in $d.slotTotals.Values) { $totalSamples += [int]$v }
     $trackedHours = [math]::Round($totalSamples * [double]$Config.sampleEverySeconds / 3600, 1)
 
+    $startup = Get-StartupNames
     $apps = foreach ($a in $candidates) {
+        $hasWindow = [bool](Get-Process -Name $a.process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
         [ordered]@{
             id              = $a.id
             name            = $a.label
+            kind            = $a.kind
             userPriority    = $a.priority
             memoryMB        = Get-AppMemoryMB $a
+            hasOpenWindow   = $hasWindow
+            startsWithWindows = [bool]($a.startsAtLogin -or $startup[([string]$a.process).ToLower()])
             learnedUsage    = Get-LearnedProfile $d $a
         }
     }
@@ -365,7 +645,10 @@ function Build-JevState($d, $candidates) {
 }
 
 function Invoke-Jev($d) {
-    $candidates = @($Config.apps | Where-Object { $_.enabled -ne $false -and (Test-AppRunning $_) })
+    $minMB = if ($null -ne $Config.minMBToConsider) { [int]$Config.minMBToConsider } else { 25 }
+    $candidates = @($Config.apps | Where-Object {
+        $_.enabled -ne $false -and (Test-AppRunning $_) -and ($_.kind -eq 'service' -or (Get-AppMemoryMB $_) -ge $minMB)
+    })
     if ($candidates.Count -eq 0) { Write-Host "No managed apps are running - nothing to decide."; return @() }
 
     $questions = [ordered]@{}
@@ -499,6 +782,29 @@ switch ($Command.ToLower()) {
         }
     }
 
+    'discover' {
+        $found = @(Find-BackgroundApps)
+        if (-not $found) { Write-Host "No new background apps found."; break }
+        $added = Add-DiscoveredApps $found
+        Write-Host "Found and added $($added.Count) app(s):" -ForegroundColor Cyan
+        foreach ($f in ($found | Sort-Object mb -Descending)) {
+            $a = $f.app
+            $tag = if ($a.enabled) { 'managed' } else { 'off' }
+            Write-Host ("  {0,5} MB  {1,-40} {2,-8} {3}{4}" -f $f.mb, $a.label, $tag, $(if ($a.startsAtLogin) { '[starts at login] ' } else { '' }), $a.note) -ForegroundColor $(if ($a.enabled) { 'White' } else { 'DarkYellow' })
+        }
+        Write-Host "Apps marked 'off' are listed but left alone until you tick Manage in the window."
+    }
+
+    'check' {
+        $targets = if ($Name) { @(Get-App $Name) } else { @($Config.apps | Where-Object { Test-AppRunning $_ }) }
+        foreach ($a in $targets) {
+            $issues = @(Get-SafetyIssues $a)
+            if ($issues) { Write-Host ("  RISKY  {0,-14} {1}" -f $a.id, ($issues -join '; ')) -ForegroundColor Yellow }
+            else { Write-Host ("  ok     {0,-14} nothing depends on it" -f $a.id) -ForegroundColor Green }
+        }
+        Write-Host "Every close is also verified afterwards (services, open apps, internet) and undone if anything broke." -ForegroundColor DarkGray
+    }
+
     'decide' {
         $d = Load-Data
         $results = Invoke-Jev $d
@@ -517,11 +823,20 @@ switch ($Command.ToLower()) {
         Write-Host "Watching. Mode: $mode. Ctrl+C to stop." -ForegroundColor Cyan
         Write-Log "WATCH started ($mode)"
         $lastDecide = [datetime]::MinValue
+        $lastDiscover = [datetime]::MinValue
         $cpuPrev = @{}
         while ($true) {
             try {
                 # Re-read settings each round so changes made in the UI apply without a restart.
                 $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+
+                $every = if ($Config.discoverEveryMinutes) { [int]$Config.discoverEveryMinutes } else { 60 }
+                if (((Get-Date) - $lastDiscover).TotalMinutes -ge $every) {
+                    $lastDiscover = Get-Date
+                    $added = Add-DiscoveredApps (Find-BackgroundApps)
+                    foreach ($a in $added) { Write-Log ("DISCOVER {0} ({1}) managed={2} {3}" -f $a.id, $a.label, $a.enabled, $a.note) }
+                }
+
                 $d = Load-Data
                 Add-UsageSample $d $cpuPrev
                 Save-Data $d

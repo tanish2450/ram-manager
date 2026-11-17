@@ -8,6 +8,10 @@
   "onlyWhenRamAbove": 70,
   "decideEveryMinutes": 10,
   "sampleEverySeconds": 30,
+  "minMBToConsider": 25,
+  "discoverEveryMinutes": 60,
+  "discoverMinMB": 15,
+  "ignored": [],
 
   "neverTouch": ["chrome", "msedge", "firefox", "explorer", "Code", "claude", "powershell", "pwsh", "WindowsTerminal", "Taskmgr", "MsMpEng", "dwm"],
 
